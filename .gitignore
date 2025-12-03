@@ -1,0 +1,19 @@
+# Rust build artifacts
+/target/
+
+# Cargo lock file (optional, uncomment if library)
+# Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+/voice_backups/
+compare_result.txt
