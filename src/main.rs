@@ -6,6 +6,10 @@ use std::collections::HashMap;
 use std::fs;
 
 use std::path::PathBuf;
+use std::os::windows::process::CommandExt;
+use std::process::Command;
+
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 const BF6_APP_ID: &str = "2807960";
 
@@ -408,20 +412,19 @@ impl BF6VoiceSwitcher {
 
         // 递归查找备份中的所有语音文件夹和 .toc 文件
         let (voice_folders, toc_files) = self.find_voice_files(&backup_path, &backup_info.lang_code);
-        let options = fs_extra::dir::CopyOptions::new().overwrite(true);
         let mut success = true;
         let mut restored_folders = 0;
         let mut restored_files = 0;
 
-        // 恢复文件夹
+        // 使用 Junction 链接文件夹
         for rel_path in &voice_folders {
             let src_folder = backup_path.join(rel_path);
             let dst_parent = target.join(rel_path.parent().unwrap_or(rel_path));
             let dst_folder = target.join(rel_path);
             
-            // 先删除目标文件夹（如果存在）
-            if dst_folder.exists() {
-                let _ = fs::remove_dir_all(&dst_folder);
+            // 先删除目标
+            if dst_folder.exists() || Self::is_junction(&dst_folder) {
+                let _ = Self::remove_junction_or_dir(&dst_folder);
             }
             
             // 创建目标父目录
@@ -432,8 +435,9 @@ impl BF6VoiceSwitcher {
                 break;
             }
             
-            if let Err(e) = fs_extra::dir::copy(&src_folder, &dst_parent, &options) {
-                self.status_message = format!("恢复 {} 失败: {}", rel_path.display(), e);
+            // 创建 Junction
+            if let Err(e) = Self::create_junction(&src_folder, &dst_folder) {
+                self.status_message = format!("创建链接 {} 失败: {}", rel_path.display(), e);
                 self.is_error = true;
                 success = false;
                 break;
@@ -441,7 +445,7 @@ impl BF6VoiceSwitcher {
             restored_folders += 1;
         }
 
-        // 恢复 .toc 文件
+        // 复制 .toc 文件
         if success {
             for rel_path in &toc_files {
                 let src_file = backup_path.join(rel_path);
@@ -470,12 +474,49 @@ impl BF6VoiceSwitcher {
             let lang = self.languages.get(backup_info.lang_code.as_str());
             let lang_name = lang.map(|l| l.name).unwrap_or(&backup_info.lang_code);
             let miles_lang = lang.map(|l| l.miles_lang).unwrap_or("");
-            self.status_message = format!("语音已恢复为 {}！({} 个文件夹, {} 个toc文件)\n请添加启动项: +miles_language {}", 
+            self.status_message = format!("语音已链接为 {}！({} 个链接, {} 个toc文件)\n请添加启动项: +miles_language {}", 
                 lang_name, restored_folders, restored_files, miles_lang);
             self.is_error = false;
         } else if restored_folders == 0 && restored_files == 0 {
             self.status_message = "备份中没有找到语音文件".to_string();
             self.is_error = true;
+        }
+    }
+
+    /// 创建 Junction
+    fn create_junction(src: &PathBuf, dst: &PathBuf) -> Result<(), String> {
+        let output = Command::new("cmd")
+            .args(["/C", "mklink", "/J", &dst.to_string_lossy(), &src.to_string_lossy()])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|e| e.to_string())?;
+        
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).to_string())
+        }
+    }
+
+    /// 检查路径是否为 Junction
+    fn is_junction(path: &PathBuf) -> bool {
+        if let Ok(metadata) = fs::symlink_metadata(path) {
+            metadata.file_type().is_symlink()
+        } else {
+            false
+        }
+    }
+
+    /// 删除 Junction 或普通目录
+    fn remove_junction_or_dir(path: &PathBuf) -> Result<(), std::io::Error> {
+        if Self::is_junction(path) {
+            Command::new("cmd")
+                .args(["/C", "rmdir", &path.to_string_lossy()])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()?;
+            Ok(())
+        } else {
+            fs::remove_dir_all(path)
         }
     }
 
@@ -525,8 +566,8 @@ impl BF6VoiceSwitcher {
         // 删除文件夹
         for rel_path in &voice_folders {
             let folder_path = source.join(rel_path);
-            if folder_path.exists() {
-                if let Err(e) = fs::remove_dir_all(&folder_path) {
+            if folder_path.exists() || Self::is_junction(&folder_path) {
+                if let Err(e) = Self::remove_junction_or_dir(&folder_path) {
                     self.status_message = format!("删除 {} 失败: {}", rel_path.display(), e);
                     self.is_error = true;
                     return;
@@ -621,6 +662,9 @@ impl eframe::App for BF6VoiceSwitcher {
                         if let Some(lang) = self.languages.get(*code) {
                             if ui.selectable_label(self.selected_lang_idx == idx, lang.name).clicked() {
                                 self.selected_lang_idx = idx;
+                                if let Some(backup_idx) = self.available_backups.iter().position(|b| b.lang_code == *code) {
+                                    self.selected_backup_idx = backup_idx;
+                                }
                             }
                         }
                     }
