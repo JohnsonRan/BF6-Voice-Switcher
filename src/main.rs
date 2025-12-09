@@ -239,21 +239,37 @@ impl BF6VoiceSwitcher {
     }
 
     fn find_voice_files_recursive(
-        &self, root: &PathBuf, current: &PathBuf, 
-        folder_names: &[String], toc_names: &[String],
-        folders: &mut Vec<PathBuf>, toc_files: &mut Vec<PathBuf>
+        &self,
+        root: &PathBuf,
+        current: &PathBuf,
+        folder_names: &[String],
+        toc_names: &[String],
+        folders: &mut Vec<PathBuf>,
+        toc_files: &mut Vec<PathBuf>,
     ) {
-        let Ok(entries) = fs::read_dir(current) else { return };
+        let Ok(entries) = fs::read_dir(current) else {
+            return;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
-            if path.is_dir() {
+            let is_dir = path.is_dir() || Self::is_junction(&path);
+            
+            if is_dir {
                 if folder_names.contains(&name) {
                     if let Ok(rel) = path.strip_prefix(root) {
                         folders.push(rel.to_path_buf());
                     }
-                } else {
-                    self.find_voice_files_recursive(root, &path, folder_names, toc_names, folders, toc_files);
+                } else if !Self::is_junction(&path) {
+                    // 只递归普通目录，不递归 Junction
+                    self.find_voice_files_recursive(
+                        root,
+                        &path,
+                        folder_names,
+                        toc_names,
+                        folders,
+                        toc_files,
+                    );
                 }
             } else if toc_names.contains(&name) {
                 if let Ok(rel) = path.strip_prefix(root) {
@@ -423,8 +439,8 @@ impl BF6VoiceSwitcher {
             let dst_folder = target.join(rel_path);
             
             // 先删除目标
-            if dst_folder.exists() || Self::is_junction(&dst_folder) {
-                let _ = Self::remove_junction_or_dir(&dst_folder);
+            if Self::is_junction(&dst_folder) {
+                let _ = Self::remove_junction(&dst_folder);
             }
             
             // 创建目标父目录
@@ -500,24 +516,23 @@ impl BF6VoiceSwitcher {
 
     /// 检查路径是否为 Junction
     fn is_junction(path: &PathBuf) -> bool {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        
         if let Ok(metadata) = fs::symlink_metadata(path) {
-            metadata.file_type().is_symlink()
+            (metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
         } else {
             false
         }
     }
 
-    /// 删除 Junction 或普通目录
-    fn remove_junction_or_dir(path: &PathBuf) -> Result<(), std::io::Error> {
-        if Self::is_junction(path) {
-            Command::new("cmd")
-                .args(["/C", "rmdir", &path.to_string_lossy()])
-                .creation_flags(CREATE_NO_WINDOW)
-                .output()?;
-            Ok(())
-        } else {
-            fs::remove_dir_all(path)
-        }
+    /// 删除 Junction
+    fn remove_junction(path: &PathBuf) -> Result<(), std::io::Error> {
+        Command::new("cmd")
+            .args(["/C", "rmdir", &path.to_string_lossy()])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()?;
+        Ok(())
     }
 
     fn check_version_match(&self) -> Option<(String, String)> {
@@ -563,11 +578,11 @@ impl BF6VoiceSwitcher {
         let mut deleted_folders = 0;
         let mut deleted_files = 0;
 
-        // 删除文件夹
+        // 删除 Junction
         for rel_path in &voice_folders {
             let folder_path = source.join(rel_path);
-            if folder_path.exists() || Self::is_junction(&folder_path) {
-                if let Err(e) = Self::remove_junction_or_dir(&folder_path) {
+            if Self::is_junction(&folder_path) {
+                if let Err(e) = Self::remove_junction(&folder_path) {
                     self.status_message = format!("删除 {} 失败: {}", rel_path.display(), e);
                     self.is_error = true;
                     return;
